@@ -1,25 +1,19 @@
 /*
-  Initial release:  02/21/2019
-  updated: 06/04/2019 (relay output)
+  RELEASE DATE 190607 yymmdd
+ 
   Author: Matt FowlerFinn
-  Platforms: WEMOS D1 lite & W
+  Platforms: ESP32 & 8266
   ------------------------------------------------------------------------
   Description: 
-  espresso pid
+  espresso PID controller w/ display & Gaggia splash startup
 
-  Sensor:
-  ds18b20 on i2c bus
+  Hardware:
+  ds18b20 on Onewire bus, SSD1306 on i2c bus, output to Solid-State Relay (not pwm)
   ------------------------------------------------------------------------
   License:
   Released under the MIT license. Please check LICENSE.txt for more
   information.  All text above must be included in any redistribution. 
 */
-
-/*TODO:
- * remove adafruit(now broken w/ remapped i2c), port to u8g2
- * add gaggia logo on startup
- * add status display
- */
 #include <Arduino.h>
 #include <U8g2lib.h>
 
@@ -27,7 +21,6 @@
 #include <DallasTemperature.h>
 #include <PID_v1.h>
 #include <Wire.h>
-
 
 #if (ESP32)  // --HELTEC WIFI 32 (ESP32)-- 
   #warning "compiling for HELTEC WIFI 32 (ESP32)"
@@ -59,8 +52,8 @@ DeviceAddress insideThermometer;
 
 double Setpoint = 103; //99c-107c for 95c at grouphead
 int toleranceWindow = 2; // +/- degrees for acceptable operation feedback 
-double aggKp=100, aggKi=0, aggKd=0;
-double Kp=10, Ki=.5, Kd=95; //was 30,10,90
+double aggKp=1000, aggKi=0, aggKd=0;
+double Kp=400, Ki=0, Kd=1000; //was 30,10,90
 
 float celsius;
 double Input, Output;
@@ -69,10 +62,12 @@ PID myPID(&Input, &Output, &Setpoint, aggKp, aggKi, aggKd, DIRECT);
 
 //freq to run pid and switch on/off the heater AND OUTPUT SCALE
 int WindowSize = 1000; //in microseconds
-int pidMaxValue = 100;
+int pidMaxValue = 1000;
 unsigned long windowStartTime;
 
-bool tempReady;
+bool tempReady = false;
+bool firstStart = true;
+bool senseSafe;
 
 
 #define Gaggia_width 128
@@ -136,8 +131,6 @@ void drawGaggia() {
 }
 
 void setup()   {     
-  tempReady = false;
-  
   Serial.begin(SERIAL_BAUD);
   delay(1000);
 
@@ -171,6 +164,7 @@ void setup()   {
   myPID.SetOutputLimits(0, pidMaxValue);
   windowStartTime = millis();
   myPID.SetMode(AUTOMATIC);
+  myPID.SetSampleTime(1000);
   
   u8g2.begin();
   drawGaggia();
@@ -179,32 +173,14 @@ void setup()   {
   u8g2.setDrawColor(1);
   u8g2.setFontPosBottom();
   u8g2.setFontDirection(0);
-  u8g2.drawStr(0, 64, "espresso pid - v1.1");
+  u8g2.drawStr(0, 64, "espresso pid - v1.2");
   u8g2.sendBuffer();
   delay(5000);
-  
-  /*
-  
-  display.setTextColor(WHITE);
-  display.clearDisplay();
-  
-  //version annotation
-  Serial.println("espresso pid - v1.1");
-  display.setCursor(0,0);
-  display.println("espresso pid");
-  display.setCursor(0,15);
-  display.println("v1.1");
-  display.setCursor(0,50);
-  display.println("Matt FowlerFinn");
-  display.display();
-  display.setFont(&FreeSansBold9pt7b);
-  display.setTextSize(1);
-  delay(1000); 
-  */
-  
+
 }
 
 //////////////////////////////////////////////////////////////////
+
 void sampleTemp() {
   sensors.requestTemperatures(); // Send the command to get temperatures
   float tempC = sensors.getTempC(insideThermometer);
@@ -212,23 +188,22 @@ void sampleTemp() {
   Input = celsius;
 }
 
-void calcPID() {
-  //myPID.Compute();
-  int scaler = ( WindowSize / pidMaxValue );
-  int scaledOutput = (Output * scaler);
-  
-  if (millis() - windowStartTime > WindowSize)
-  { 
-    myPID.Compute();
+void calcPID() { 
+  myPID.Compute(); //will only run when sample size has passed
+  long currentTime = millis();
+  if (currentTime - windowStartTime > WindowSize)
+  {
     windowStartTime += WindowSize; //time to shift the Relay Window
   }
-  if ((scaledOutput > millis() - windowStartTime) && (celsius < Setpoint)) {
-    digitalWrite(SSRPin, HIGH);
+  if ((Output > currentTime - windowStartTime) && (celsius < Setpoint) && (senseSafe)) {
     Serial.print("ON , ");
+    digitalWrite(SSRPin, HIGH);
+    digitalWrite(LED_BUILTIN, HIGH);
   }
   else {
     Serial.print("OFF, ");
     digitalWrite(SSRPin, LOW);
+    digitalWrite(LED_BUILTIN, LOW);
   }
 }
   
@@ -240,14 +215,24 @@ void refreshDisplay() {
   u8g2.setFontPosTop();
   u8g2.setFontDirection(0);
   u8g2.setCursor(0, 0);
-  if(tempReady) {
+  
+  if(tempReady && senseSafe) {
     u8g2.setFont( u8g2_font_crox5hb_tf);
     u8g2.print("Ready!");
   }
-  else {
-    u8g2.setFont( u8g2_font_crox3hb_tf);
-    u8g2.print("...please wait");
+  else if(celsius >= Setpoint + toleranceWindow && senseSafe) {
+    u8g2.setFont( u8g2_font_crox1hb_tf);
+    u8g2.print("overtemp...heater OFF");
   }
+  else if(celsius < Setpoint && senseSafe) {
+    u8g2.setFont( u8g2_font_crox3hb_tf);
+    u8g2.print("...heating up");
+  }
+  else {
+    u8g2.setFont( u8g2_font_crox1hb_tf);
+    u8g2.print("ERROR! heater OFF");
+  }
+  
   u8g2.setFontPosBottom();
   u8g2.setCursor(0, 64);
   u8g2.setFont( u8g2_font_crox5hb_tf);
@@ -256,49 +241,22 @@ void refreshDisplay() {
   u8g2.setFont( u8g2_font_crox1h_tf);
   u8g2.print("/ ");
   u8g2.print(Setpoint,0);
- 
-
-  
   u8g2.sendBuffer();
-  /*
-  display.setFont(&FreeSans12pt7b);
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
-  display.clearDisplay();
-  display.setCursor(0,18);
-  display.print(celsius,1);
-  display.println("c");
-  display.display();
-  */
-
+  
   Serial.print(celsius);
   Serial.print("C, ");
 }
 
-void loop(){
-    /*  // picture loop  
-    u8g2.firstPage();  
-    do {
-      refreshDisplay();
-    } while( u8g2.nextPage() );*/
-    
-    sampleTemp();
-    watchDog();
-    adaptTune();
-    calcPID();
-    statusLight();
-    refreshDisplay();
-    Serial.println();
-    delay (500);
-    }
-
-void watchDog() {
-  if (celsius > (Setpoint+(toleranceWindow*2)))
-  {  //TURN OFF PID IF OVER SETPOINT
-    myPID.SetMode(MANUAL);
-    Output = 0;
-    Serial.println("OVERTEMP!!");
-    delay(10000);
+void watchDog() { //Safety shutoffs
+  if( celsius < 0 ) { //sensor value hits -127 if disconnected
+    senseSafe = false;
+  }
+  else if (celsius > (Setpoint+(toleranceWindow*2))) {  //if overheated
+    senseSafe = false;
+  }
+  //add condition for glitch temp?
+  else { //otherwise system seems safe
+    senseSafe = true;
   }
 }
 
@@ -313,7 +271,11 @@ void printAddress(DeviceAddress deviceAddress)
 
 void statusLight() {
     //LED indicator
-  if( (abs(Setpoint - celsius)) < toleranceWindow ) { 
+  if(firstStart && celsius >= Setpoint) {
+    firstStart = false; //we've warmed up enough to start using our tolerance window
+  }
+  
+  if( (abs(Setpoint - celsius)) < toleranceWindow && !firstStart) { 
       tempReady = true;
       //digitalWrite(LED_BUILTIN, LOW);
       Serial.print("READY TO BREW, ");
@@ -326,20 +288,31 @@ void statusLight() {
 }
 
 void adaptTune() {
-  if (celsius < 85) {
+  if (celsius < 90) {
     myPID.SetTunings(aggKp, aggKi, aggKd);
   }
   else {
     myPID.SetTunings(Kp, Ki, Kd);
   }
   
-  if (celsius > (Setpoint))
+  if (celsius > (Setpoint + toleranceWindow))
   {  //TURN OFF PID IF OVER SETPOINT
     myPID.SetMode(MANUAL);
-    Output = 0;
+    digitalWrite(SSRPin, LOW);
   }
   else
   {
     myPID.SetMode(AUTOMATIC); 
   }
 }
+
+void loop(){    
+    sampleTemp();
+    watchDog();
+    adaptTune();
+    calcPID();
+    statusLight();
+    refreshDisplay();
+    Serial.println();
+    //delay (100);
+    }
